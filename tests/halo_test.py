@@ -13838,6 +13838,95 @@ def run_checks(m, version, profile, results):
         return ok, f"{res}"
     check("Today-Pane: Ein-/Ausblenden flüssig (kein Sprung), Suchfeld und alle Knöpfe gleiten mit, Suchfeld ändert seine Breite stufenlos, einklappende Knöpfe blenden aus, Überschrift während der Bewegung da und am Ende ohne Ruck", today_animation, results)
 
+    # NUR PRÜFZWEIG pruef/flackern (kommt nicht nach main): Ursachen der flackernden Animationsprüfungen belegen
+    def diag_flackern():
+        rechner = ""
+        try:
+            cpu = [l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")]
+            rechner = f"{cpu[0] if cpu else '?'} ×{len(cpu)}, Last {open('/proc/loadavg').read().split()[:3]}"
+        except Exception:
+            rechner = sys.platform
+        m.cmd("WebDriver:SetTimeouts", {"script": 400000})
+        try:
+            res = m.js(r"""
+              const out = {};
+              Services.prefs.setBoolPref("javascript.options.mem.notify", true);
+              const stoer = []; const obs = { observe(s, topic, data) { let j = {}; try { j = JSON.parse(data); } catch {}
+                stoer.push([Math.round(performance.now()), topic.startsWith("garbage") ? "GC" : "CC", Math.round(j.max_pause ?? j.max_slice_pause ?? -1), Math.round(j.total_time ?? j.duration ?? -1), String(j.reason ?? "").slice(0, 24)]); } };
+              Services.obs.addObserver(obs, "garbage-collection-statistics"); Services.obs.addObserver(obs, "cycle-collection-statistics");
+              let hbLast = performance.now(); const hb = []; const hbId = w.setInterval(() => { const t = performance.now(); if (t - hbLast > 30) hb.push([hbLast, t - hbLast]); hbLast = t; }, 4);
+              const raf = win => new Promise(r => win.requestAnimationFrame(r));
+              const med = a => { const b = [...a].sort((x, y) => x - y); return b.length ? b[b.length >> 1] : 0; };
+              const ow = w.outerWidth;
+              try {
+                // 1. Today-Pane, schmales Fenster, in Echtzeit wie bisher: lange Bilder und was in ihnen lief
+                await toMail(); await ruhig(1500);
+                const panel = d.getElementById("today-pane-panel"), btn = d.getElementById("mcTodayToggle");
+                const full = Math.round(panel.getBoundingClientRect().width);
+                w.resizeTo(1100, w.outerHeight); await ruhig(1200);
+                const echt = { n: 0, rot: [0, 0], lang: [0, 0], maxFrame: [[], []], faelle: [] };
+                for (let i = 0; i < 24; i++) for (const phase of ["aus", "ein"]) {
+                  const vorGC = i % 2;   // jede zweite Runde: vor der Messung aufräumen (GC und CC erzwingen)
+                  if (vorGC) { Cu.forceGC(); Cu.forceCC(); await raf(w); await raf(w); }
+                  const ws = [], ts = []; btn.click(); const t0 = performance.now();
+                  while (performance.now() - t0 < 600) { ws.push(Math.round(panel.getBoundingClientRect().width)); ts.push(performance.now()); await raf(w); }
+                  const t1 = performance.now(); await ruhig(300);
+                  const mov = ws.map((v, k) => k > 0 && v != ws[k - 1]);
+                  const dts = ts.slice(1).map((t, k) => [t - ts[k], ts[k], t]).filter((_, k) => mov[k + 1]);
+                  const maxJump = Math.max(0, ...ws.slice(1).map((v, k) => Math.abs(v - ws[k]))), steps = mov.filter(Boolean).length + 1;
+                  const mx = dts.reduce((a, b) => (b[0] > a[0] ? b : a), [0, 0, 0]), md = med(dts.map(x => x[0]));
+                  echt.n++; echt.maxFrame[vorGC].push(Math.round(mx[0]));
+                  const rot = steps < 6 || maxJump >= full / 2 || md > 27.5;
+                  if (rot) echt.rot[vorGC]++;
+                  if (mx[0] > 40) { echt.lang[vorGC]++;
+                    echt.faelle.push({ i, phase, vorGC, ms: Math.round(mx[0]), steps, maxJump, rot,
+                      // Herzschlag (Zeitgeber alle 4 ms) im langen Bild: steht er auch, war der Hauptfaden blockiert
+                      herz: Math.round(Math.max(0, ...hb.filter(([a, l]) => a + l > mx[1] && a < mx[2]).map(([, l]) => l))),
+                      gc: stoer.filter(([t]) => t >= mx[1] - 5 && t <= mx[2] + 60).map(x => x.slice(1).join("/")) }); }
+                }
+                echt.maxFrame = echt.maxFrame.map(a => a.sort((x, y) => x - y).join(" "));
+                out.todayEcht = echt; out.stoerGesamt = { GC: stoer.filter(x => x[1] == "GC").length, CC: stoer.filter(x => x[1] == "CC").length,
+                  gcPause: stoer.filter(x => x[1] == "GC").map(x => x[2]).sort((a, b) => a - b).slice(-6).join(" "), ccPause: stoer.filter(x => x[1] == "CC").map(x => x[2]).sort((a, b) => a - b).slice(-6).join(" ") };
+                // 2. dasselbe im festen Bildtakt: Schritte, größter Sprung, Aufbauzeit je Bild
+                const takt = { steps: [], maxJump: [], kosten: [], kostenMax: [] };
+                for (let i = 0; i < 12; i++) for (const phase of ["aus", "ein"]) {
+                  const ws = []; const bild = () => ws.push(Math.round(panel.getBoundingClientRect().width));
+                  btn.click(); bild(); const kosten = await imTakt(600, bild); await ruhig(300);
+                  const mov = ws.map((v, k) => k > 0 && v != ws[k - 1]);
+                  takt.steps.push(mov.filter(Boolean).length + 1); takt.maxJump.push(Math.max(0, ...ws.slice(1).map((v, k) => Math.abs(v - ws[k]))));
+                  takt.kosten.push(bildKosten(kosten, mov.slice(1))); takt.kostenMax.push(Math.max(...kosten.filter((_, k) => mov[k + 1])));
+                }
+                out.todayTakt = { steps: [...new Set(takt.steps)].join(" "), maxJump: [...new Set(takt.maxJump)].join(" "), kostenMedian: takt.kosten.sort((a, b) => a - b).join(" "), kostenMax: takt.kostenMax.sort((a, b) => a - b).join(" ") };
+                w.resizeTo(ow, w.outerHeight); await ruhig(800);
+                // 3. Seitenleiste (Mail), Karten 1280 px: Echtzeit gegen festen Takt
+                const sb = d.getElementById("spacesPinnedButton"); w.resizeTo(1280, 900);
+                const a3 = await toMail(); await wait(1500);
+                const fp = a3.document.getElementById("folderPane"), tp = a3.document.getElementById("threadPane"), mp = a3.document.getElementById("messagePane");
+                const snap = () => [fp, tp, mp].map(e => Math.round(e.getBoundingClientRect().width * 10) / 10).join("|");
+                const se = { frameMs: [], steps: [] }, st = { kosten: [], steps: [] };
+                for (let i = 0; i < 8; i++) {
+                  const fr = [], ts = []; sb.click(); const t0 = performance.now();
+                  while (performance.now() - t0 < 600) { await raf(a3); fr.push(snap()); ts.push(performance.now()); }
+                  await ruhig(500);
+                  const dts = fr.map((f, k) => k && f != fr[k - 1] ? ts[k] - ts[k - 1] : 0).filter(Boolean);
+                  se.frameMs.push(Math.round(med(dts))); se.steps.push(dts.length);
+                }
+                for (let i = 0; i < 8; i++) {
+                  const fr = []; sb.click(); const kosten = await imTakt(600, () => fr.push(snap())); await ruhig(500);
+                  const mov = fr.map((f, k) => k > 0 && f != fr[k - 1]);
+                  st.kosten.push(Math.round(bildKosten(kosten, mov))); st.steps.push(mov.filter(Boolean).length);
+                }
+                out.seiteEcht = { frameMs: se.frameMs.join(" "), steps: se.steps.join(" ") }; out.seiteTakt = { kostenMs: st.kosten.join(" "), steps: st.steps.join(" ") };
+              } finally {
+                w.clearInterval(hbId); Services.obs.removeObserver(obs, "garbage-collection-statistics"); Services.obs.removeObserver(obs, "cycle-collection-statistics");
+                Services.prefs.clearUserPref("javascript.options.mem.notify"); w.resizeTo(1500, 900); await wait(800);
+              }
+              return out;""")
+        finally:
+            m.cmd("WebDriver:SetTimeouts", {"script": 30000})
+        return True, f"Rechner: {rechner} – {res}"
+    check("Diagnose Flackern (nur Prüfzweig): Today-Pane und Seitenleiste in Echtzeit und im festen Bildtakt, lange Bilder mit GC/CC und Herzschlag", diag_flackern, results)
+
     def today_tasks_end():
         # Aufgaben: am Ende des Ein-/Ausblendens springen Suchfeld (Lage, Breite), „+“ und Überschrift nicht noch einmal –
         # die Endplätze stehen von Anfang an fest (früher rechnete die Aufgabenansicht hinter der hereingleitenden Pane mit
