@@ -9680,12 +9680,20 @@ class CardEnhancer {
       for (const clusters of groups.values()) {
         for (const c of clusters) {
           keep.add(c.best);
+          // alle Zeilen des Kontakts, auch die schon früher ausgeblendeten: beim
+          // nächsten Sortieren steht nur noch der verbliebene Eintrag in der Liste
+          // (sonst vergäße das Zusammenführen die Dubletten nach dem ersten Mal)
+          const members = [...new Set(c.rows.flatMap(r => r.mcCluster || [r]))];
           // welcher Eintrag stehen bleibt (Auswahl beim Zusammenführen übertragen)
-          for (const r of c.rows) {
+          for (const r of members) {
             r.mcBest = c.best;
+            if (r != c.best) {
+              delete r.mcCluster;
+            }
           }
+          c.best.mcCluster = members;
           // in welchen Adressbüchern es diesen Kontakt gibt (für die Labels)
-          c.best.mcSources = [...new Set(c.rows.map(r => r.directory?.dirName).filter(Boolean))];
+          c.best.mcSources = [...new Set(members.map(r => r.directory?.dirName).filter(Boolean))];
         }
       }
       return rows.filter(r => keep.has(r));
@@ -9753,9 +9761,49 @@ class CardEnhancer {
         }
         return result;
       };
+      // Löschen eines zusammengeführten Kontakts löscht auch die ausgeblendeten
+      // Dubletten (wie Apple Kontakte bei verknüpften Karten): Thunderbird
+      // löscht nur die Karten der sichtbaren Zeilen, beim nächsten Neuaufbau der
+      // Liste stand die Dublette sonst wieder da. In einer Verteilerliste
+      // werden sie ebenso nur aus der Liste genommen.
+      const origDelete = Adapter.prototype.deleteSelectedCards;
+      if (typeof origDelete == "function") {
+        Adapter.prototype.deleteSelectedCards = function (...args) {
+          const extra = [];
+          try {
+            for (const i of this._tree?.selectedIndices || []) {
+              const row = this._rowMap?.[i];
+              for (const r of row?.mcCluster || []) {
+                if (r != row && r.card && !r.card.isMailList) {
+                  extra.push(r.card);
+                }
+              }
+            }
+          } catch (e) {
+            log("dedupe delete collect error", e);
+          }
+          const result = origDelete.apply(this, args);
+          const list = this.directory?.isMailList ? this.directory : null;
+          for (const card of extra) {
+            try {
+              const dir = list || MailServices.ab.getDirectoryFromUID(card.directoryUID);
+              // schon anderswo gelöscht (Sync, zweites Fenster): nichts tun
+              if (dir && !dir.readOnly && dir.hasCard(card)) {
+                dir.deleteCards([card]);
+              }
+            } catch (e) {
+              log("dedupe delete error", e);
+            }
+          }
+          return result;
+        };
+      }
       Adapter.prototype.__mcDedupe = true;
       restorers.push(() => {
         Adapter.prototype.sortBy = orig;
+        if (origDelete) {
+          Adapter.prototype.deleteSelectedCards = origDelete;
+        }
         delete Adapter.prototype.__mcDedupe;
       });
 
